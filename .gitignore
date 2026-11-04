@@ -1,0 +1,6 @@
+﻿build/
+bin/
+obj/
+*.obj
+*.pdb
+third_party/minhook/.git/
