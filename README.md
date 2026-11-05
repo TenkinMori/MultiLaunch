@@ -118,7 +118,18 @@ MultiLaunch/
   `AstralParty_CN_*.exe` 与 `AstralParty_CN_*_Data`（junction）后重新启动即可
 - 仅用于个人多账号管理，请遵守游戏用户协议
 
+## 来源与许可
+
+- `src/Redirect/cesium/steam/`（steamhack）来自 **CesiumLoader**
+  - 仓库：https://github.com/higashitaniyume/CesiumLoader
+  - 路径：`loader/CesiumLoader/steam/`
+  - 来源提交：`7a704568b1375027c51ee91eb90b20fa589b3e47`（2026-11-03）
+  - 许可证：**GNU AGPL-3.0**（全文见 `src/Redirect/cesium/LICENSE-AGPL-3.0.txt`）
+  - 本项目只做了“脱离 loader 独立编译”的最小改动，详见 `src/Redirect/cesium/NOTICE.md`
+- `third_party/minhook`：BSD-2-Clause
+- `third_party/fmt`：MIT
+
 ## License
 
-MIT（`third_party/minhook` 为 BSD-2-Clause，`third_party/fmt` 为 MIT，
-`src/Redirect/cesium/steam` 来自 CesiumLoader）
+仓库其余部分：MIT。
+**含 `src/Redirect/cesium/` 代码的 `UserDataRedirect.dll` 按 AGPL-3.0 分发**（源码已公开）。
