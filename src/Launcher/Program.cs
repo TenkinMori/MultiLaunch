@@ -79,6 +79,7 @@ namespace MultiLaunch
                     exe = args[0];
                     profile = Path.GetFullPath(args[1]);
                 }
+                EnsureSteamAppId(Path.GetDirectoryName(exe));
                 SeedSharedCaches(profile);
                 string dll = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "UserDataRedirect.dll");
                 if (!File.Exists(exe)) { Console.WriteLine("找不到游戏: " + exe); return 1; }
@@ -127,7 +128,12 @@ namespace MultiLaunch
                 var si = new STARTUPINFO();
                 si.cb = Marshal.SizeOf(si);
                 PROCESS_INFORMATION pi;
-                IntPtr env = BuildEnv("ASTRAL_PROFILE_DIR", profile, "ASTRAL_LOG", Path.Combine(profile, "redirect.log"));
+                string bypass = SteamBypassEnabled() ? "1" : "0";
+                IntPtr env = BuildEnv(new[] {
+                    "ASTRAL_PROFILE_DIR", profile,
+                    "ASTRAL_LOG", Path.Combine(profile, "redirect.log"),
+                    "ASTRAL_STEAM_BYPASS", bypass
+                });
                 if (!CreateProcess(runExe, sb, IntPtr.Zero, IntPtr.Zero, false,
                     CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
                     env, Path.GetDirectoryName(exe), ref si, out pi))
@@ -150,6 +156,61 @@ namespace MultiLaunch
                 Console.WriteLine("失败: " + e.Message);
                 return 2;
             }
+        }
+
+        private static bool SteamBypassEnabled()
+        {
+            try
+            {
+                string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
+                if (!File.Exists(path)) return true;
+                string text = File.ReadAllText(path);
+                return text.Replace(" ", "").IndexOf("\"steamBypass\":false", StringComparison.OrdinalIgnoreCase) < 0;
+            }
+            catch { return true; }
+        }
+
+        /// <summary>确保游戏目录有 steam_appid.txt（非 Steam 启动时 Steamworks 需要）。</summary>
+        private static void EnsureSteamAppId(string gameDir)
+        {
+            try
+            {
+                string path = Path.Combine(gameDir, "steam_appid.txt");
+                if (File.Exists(path))
+                {
+                    string cur = File.ReadAllText(path).Trim();
+                    if (cur.Length > 0) return;
+                }
+
+                string appId = DetectAppId(gameDir) ?? "2622000";
+                File.WriteAllText(path, appId);
+                Console.WriteLine("已写入 steam_appid.txt: " + appId);
+            }
+            catch (Exception e) { Console.WriteLine("写 steam_appid.txt 失败: " + e.Message); }
+        }
+
+        /// <summary>从 steamapps/appmanifest_*.acf 反查 AppID（按 installdir）。</summary>
+        private static string DetectAppId(string gameDir)
+        {
+            try
+            {
+                var dir = new DirectoryInfo(gameDir);
+                string installDir = dir.Name;
+                var steamapps = dir.Parent != null ? dir.Parent.Parent : null; // ...\steamapps
+                if (steamapps == null || !steamapps.Name.Equals("steamapps", StringComparison.OrdinalIgnoreCase)) return null;
+
+                foreach (var f in Directory.GetFiles(steamapps.FullName, "appmanifest_*.acf"))
+                {
+                    string text = File.ReadAllText(f);
+                    if (text.IndexOf("\"installdir\"\t\t\"" + installDir + "\"", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        var name = Path.GetFileNameWithoutExtension(f); // appmanifest_2622000
+                        return name.Replace("appmanifest_", "");
+                    }
+                }
+            }
+            catch { }
+            return null;
         }
 
         /// <summary>把大缓存（资源包）做成指向官方目录的 junction，避免每个实例重新下载；BnSdk 保持独立。</summary>
@@ -355,27 +416,29 @@ namespace MultiLaunch
             return Path.Combine(root, "v" + DateTime.Now.Ticks);
         }
 
-        private static IntPtr BuildEnv(string key, string value, string key2, string value2)
+        private static IntPtr BuildEnv(string[] pairs)
         {
             IntPtr raw = GetEnvironmentStringsW();
             var parts = new System.Collections.Generic.List<string>();
+            var keys = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < pairs.Length; i += 2) keys.Add(pairs[i]);
+
             if (raw != IntPtr.Zero)
             {
                 int off = 0;
                 while (true)
                 {
-                    IntPtr p = IntPtr.Add(raw, off * 2);
-                    string s = Marshal.PtrToStringUni(p);
+                    string s = Marshal.PtrToStringUni(new IntPtr(raw.ToInt64() + off * 2));
                     if (string.IsNullOrEmpty(s)) break;
-                    if (!s.StartsWith(key + "=", StringComparison.OrdinalIgnoreCase)) parts.Add(s);
+                    int eq = s.IndexOf('=');
+                    string k = eq > 0 ? s.Substring(0, eq) : s;
+                    if (!keys.Contains(k)) parts.Add(s);
                     off += s.Length + 1;
                 }
                 FreeEnvironmentStringsW(raw);
             }
-            parts.Add(key + "=" + value);
-            if (!string.IsNullOrEmpty(key2)) parts.Add(key2 + "=" + value2);
-            string block = string.Join("\0", parts) + "\0\0";
-            byte[] bytes = Encoding.Unicode.GetBytes(block);
+            for (int i = 0; i < pairs.Length; i += 2) parts.Add(pairs[i] + "=" + pairs[i + 1]);
+            byte[] bytes = Encoding.Unicode.GetBytes(string.Join("\0", parts) + "\0\0");
             IntPtr mem = Marshal.AllocHGlobal(bytes.Length);
             Marshal.Copy(bytes, 0, mem, bytes.Length);
             return mem;

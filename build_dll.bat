@@ -2,9 +2,13 @@
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul
 cd /d D:\AstralPartyGit\MultiLaunch
 if not exist build mkdir build
-cl /nologo /LD /O2 /EHsc /MT /D_CRT_SECURE_NO_WARNINGS ^
+cl /nologo /LD /O2 /EHsc /MT /utf-8 /std:c++17 /D_CRT_SECURE_NO_WARNINGS /DFMT_HEADER_ONLY ^
   /I third_party\minhook\include /I third_party\minhook\src ^
+  /I third_party\fmt\include ^
+  /I src\Redirect\cesium ^
   src\Redirect\UserDataRedirect.cpp ^
+  src\Redirect\cesium\steam\steamhack.cpp ^
+  src\Redirect\cesium\steam\steam_diagnostics.cpp ^
   third_party\minhook\src\buffer.c third_party\minhook\src\hde\hde64.c ^
   third_party\minhook\src\hook.c third_party\minhook\src\trampoline.c ^
   /Fe:build\UserDataRedirect.dll ^

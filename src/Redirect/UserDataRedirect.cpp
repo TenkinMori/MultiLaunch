@@ -9,6 +9,14 @@
 #include <cstdio>
 #include <winternl.h>
 #include "MinHook.h"
+#include "runtime/il2cpp_safe.h"
+#include "steam/steamhack.h"
+
+void log_line(const char* msg);
+void log_line(const std::string& msg);
+void log_line(const std::wstring& msg);
+
+static void InstallSteamHack();
 
 static std::wstring g_localLow;
 static BOOL g_enabled = FALSE;
@@ -25,6 +33,9 @@ static void LogLine(const wchar_t* msg)
 
 typedef HRESULT(WINAPI* PFN_SHKFP)(REFKNOWNFOLDERID, DWORD, HANDLE, PWSTR*);
 static PFN_SHKFP g_origSHKFP = nullptr;
+static std::wstring g_suffix;
+
+static bool ShouldRename(const std::wstring& name);
 
 // ---- ntdll mutants (catch everything) ----
 typedef NTSTATUS(NTAPI* PFN_NtCreateMutant)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, BOOLEAN);
@@ -62,7 +73,6 @@ static NTSTATUS NTAPI Hook_NtOpenMutant(PHANDLE h, ACCESS_MASK a, POBJECT_ATTRIB
 }
 
 // ---- single-instance mutex rename ----
-static std::wstring g_suffix;
 typedef HANDLE(WINAPI* PFN_CreateMutexW)(LPSECURITY_ATTRIBUTES, BOOL, LPCWSTR);
 typedef HANDLE(WINAPI* PFN_CreateMutexExW)(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
 typedef HANDLE(WINAPI* PFN_OpenMutexW)(DWORD, BOOL, LPCWSTR);
@@ -166,6 +176,19 @@ static HANDLE WINAPI Hook_OpenMutexW(DWORD access, BOOL inherit, LPCWSTR name)
 }
 
 
+static std::wstring WideFromUtf8(const std::string& s)
+{
+    if (s.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
+
+void log_line(const char* msg) { log_line(std::string(msg ? msg : "")); }
+void log_line(const std::wstring& msg) { LogLine(msg.c_str()); }
+void log_line(const std::string& msg) { LogLine(WideFromUtf8(msg).c_str()); }
+
 static std::wstring WideFromEnv(const wchar_t* name)
 {
     DWORD n = GetEnvironmentVariableW(name, nullptr, 0);
@@ -210,6 +233,173 @@ static HRESULT WINAPI Hook_SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD fla
     return S_OK;
 }
 
+// ---- 可选：Steam 绕过（ASTRAL_STEAM_BYPASS=1）----
+static BOOL g_steamBypass = FALSE;
+
+// ---- 独立实现：把 AOT 的 SteamManager.Awake() 改成 ret（不依赖任何 loader）----
+typedef void* (*FnDomainGet)();
+typedef void** (*FnDomainGetAssemblies)(void*, size_t*);
+typedef void* (*FnAssemblyGetImage)(void*);
+typedef void* (*FnClassFromName)(void*, const char*, const char*);
+typedef void* (*FnClassGetMethodFromName)(void*, const char*, int);
+typedef void* (*FnThreadAttach)(void*);
+
+static bool PatchRet(void* code)
+{
+    if (!code) return false;
+    DWORD old = 0;
+    if (!VirtualProtect(code, 1, PAGE_EXECUTE_READWRITE, &old)) return false;
+    *(unsigned char*)code = 0xC3; // ret
+    VirtualProtect(code, 1, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), code, 1);
+    return true;
+}
+
+static void PatchSteamManagerAwake()
+{
+    HMODULE ga = GetModuleHandleW(L"GameAssembly.dll");
+    if (!ga) return;
+    auto domain_get = (FnDomainGet)GetProcAddress(ga, "il2cpp_domain_get");
+    auto domain_get_assemblies = (FnDomainGetAssemblies)GetProcAddress(ga, "il2cpp_domain_get_assemblies");
+    auto assembly_get_image = (FnAssemblyGetImage)GetProcAddress(ga, "il2cpp_assembly_get_image");
+    auto class_from_name = (FnClassFromName)GetProcAddress(ga, "il2cpp_class_from_name");
+    auto class_get_method = (FnClassGetMethodFromName)GetProcAddress(ga, "il2cpp_class_get_method_from_name");
+    auto thread_attach = (FnThreadAttach)GetProcAddress(ga, "il2cpp_thread_attach");
+    if (!domain_get || !domain_get_assemblies || !assembly_get_image || !class_from_name || !class_get_method)
+    {
+        LogLine(L"bypass: il2cpp exports missing");
+        return;
+    }
+    void* domain = domain_get();
+    if (thread_attach) thread_attach(domain);
+    size_t count = 0;
+    void** assemblies = domain_get_assemblies(domain, &count);
+    if (!assemblies) { LogLine(L"bypass: no assemblies"); return; }
+
+    for (size_t i = 0; i < count; i++)
+    {
+        void* image = assembly_get_image(assemblies[i]);
+        if (!image) continue;
+        void* klass = class_from_name(image, "", "SteamManager");
+        if (!klass) continue;
+        void* method = class_get_method(klass, "Awake", 0);
+        if (!method) { LogLine(L"bypass: SteamManager.Awake not found"); return; }
+        void* code = *(void**)method; // MethodInfo.methodPointer 在偏移 0
+        bool ok = PatchRet(code);
+        wchar_t buf[128];
+        swprintf_s(buf, L"bypass: SteamManager.Awake patched=%d code=%p", (int)ok, code);
+        LogLine(buf);
+        return;
+    }
+    LogLine(L"bypass: SteamManager class not found");
+}
+
+typedef bool(WINAPI* PFN_Init)();
+typedef int(WINAPI* PFN_InitFlat)();
+typedef bool(WINAPI* PFN_Restart)(unsigned int);
+typedef void(WINAPI* PFN_Shutdown)();
+static PFN_Init g_origInit = nullptr;
+static PFN_InitFlat g_origInitFlat = nullptr;
+static PFN_Restart g_origRestart = nullptr;
+static PFN_Shutdown g_origShutdown = nullptr;
+
+static bool WINAPI Hook_SteamInit() { LogLine(L"steam: Init -> true"); return true; }
+static int WINAPI Hook_SteamInitFlat() { LogLine(L"steam: InitFlat -> 0"); return 0; }
+static bool WINAPI Hook_SteamRestart(unsigned int) { LogLine(L"steam: RestartAppIfNecessary -> false"); return false; }
+static void WINAPI Hook_SteamShutdown() { LogLine(L"steam: Shutdown (noop)"); }
+
+static DWORD WINAPI SteamBypassThread(LPVOID)
+{
+    // 先等 GameAssembly/il2cpp 可用，再改 SteamManager.Awake
+    for (int i = 0; i < 600; i++)
+    {
+        if (GetModuleHandleW(L"GameAssembly.dll")) { InstallSteamHack(); break; }
+        Sleep(100);
+    }
+    for (int i = 0; i < 600; i++)
+    {
+        HMODULE mod = GetModuleHandleW(L"steam_api64.dll");
+        if (mod)
+        {
+            MH_CreateHookApi(L"steam_api64.dll", "SteamAPI_Init", &Hook_SteamInit, reinterpret_cast<LPVOID*>(&g_origInit));
+            MH_CreateHookApi(L"steam_api64.dll", "SteamAPI_InitFlat", &Hook_SteamInitFlat, reinterpret_cast<LPVOID*>(&g_origInitFlat));
+            MH_CreateHookApi(L"steam_api64.dll", "SteamAPI_RestartAppIfNecessary", &Hook_SteamRestart, reinterpret_cast<LPVOID*>(&g_origRestart));
+            MH_CreateHookApi(L"steam_api64.dll", "SteamAPI_Shutdown", &Hook_SteamShutdown, reinterpret_cast<LPVOID*>(&g_origShutdown));
+            MH_EnableHook(MH_ALL_HOOKS);
+            LogLine(L"steam bypass: steam_api64 hooks installed");
+            return 0;
+        }
+        Sleep(100);
+    }
+    LogLine(L"steam bypass: steam_api64 not loaded");
+    return 0;
+}
+
+static void* Proc(HMODULE ga, const char* name)
+{
+    return (void*)GetProcAddress(ga, name);
+}
+
+static bool FillIl2CppTable(cesium_safe::il2cpp_tbl& t)
+{
+    HMODULE ga = GetModuleHandleW(L"GameAssembly.dll");
+    if (!ga) return false;
+#define F(field, name) t.field = (decltype(t.field))Proc(ga, name)
+    F(domain_get, "il2cpp_domain_get");
+    F(assembly_get_image, "il2cpp_assembly_get_image");
+    F(image_get_assembly, "il2cpp_image_get_assembly");
+    F(class_from_name, "il2cpp_class_from_name");
+    F(class_get_method_from_name, "il2cpp_class_get_method_from_name");
+    F(class_get_methods, "il2cpp_class_get_methods");
+    F(method_get_name, "il2cpp_method_get_name");
+    F(method_get_param, "il2cpp_method_get_param");
+    F(method_get_param_count, "il2cpp_method_get_param_count");
+    F(runtime_invoke, "il2cpp_runtime_invoke");
+    F(thread_attach, "il2cpp_thread_attach");
+    F(domain_get_assemblies, "il2cpp_domain_get_assemblies");
+    F(image_get_name, "il2cpp_image_get_name");
+    F(get_corlib, "il2cpp_get_corlib");
+    F(type_get_name, "il2cpp_type_get_name");
+    F(array_class_get, "il2cpp_array_class_get");
+    F(array_new, "il2cpp_array_new");
+    F(array_object_header_size, "il2cpp_array_object_header_size");
+    F(exception_get_message, "il2cpp_exception_get_message");
+    F(string_chars, "il2cpp_string_chars");
+    F(method_get_return_type, "il2cpp_method_get_return_type");
+    F(type_get_object, "il2cpp_type_get_object");
+    F(class_from_system_type, "il2cpp_class_from_system_type");
+    F(object_new, "il2cpp_object_new");
+    F(value_box, "il2cpp_value_box");
+    F(class_get_property_from_name, "il2cpp_class_get_property_from_name");
+    F(property_get_get_method, "il2cpp_property_get_get_method");
+    F(object_get_class, "il2cpp_object_get_class");
+    F(class_get_name, "il2cpp_class_get_name");
+    F(class_is_valuetype, "il2cpp_class_is_valuetype");
+    F(object_unbox, "il2cpp_object_unbox");
+    F(class_get_parent, "il2cpp_class_get_parent");
+    F(class_get_field_from_name, "il2cpp_class_get_field_from_name");
+    F(field_get_offset, "il2cpp_field_get_offset");
+    F(field_get_value, "il2cpp_field_get_value");
+    F(field_get_value_object, "il2cpp_field_get_value_object");
+    F(class_get_fields, "il2cpp_class_get_fields");
+    F(field_get_name, "il2cpp_field_get_name");
+    F(class_value_size, "il2cpp_class_value_size");
+    F(array_length, "il2cpp_array_length");
+    F(gchandle_new, "il2cpp_gchandle_new");
+#undef F
+    return t.complete();
+}
+
+static void InstallSteamHack()
+{
+    cesium_safe::il2cpp_tbl t;
+    if (!FillIl2CppTable(t)) { LogLine(L"steamhack: il2cpp table incomplete"); return; }
+    bool ok = steamhack_install(t, true, true, true, true, "auto", false, true);
+    wchar_t buf[128];
+    swprintf_s(buf, L"steamhack: install=%d hooks=%d", (int)ok, steamhack_hook_count());
+    LogLine(buf);
+}
+
 BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
 {
     if (reason != DLL_PROCESS_ATTACH) return TRUE;
@@ -222,34 +412,27 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
     EnsureDir(g_localLow);
     g_enabled = TRUE;
 
-    // 多开：给当前 profile 一个唯一后缀
+    wchar_t buf[64] = {0};
+    unsigned h = 0;
+    for (size_t i = 0; i < g_localLow.size(); i++) h = h * 131 + (unsigned)g_localLow[i];
+    swprintf_s(buf, L"_P%08X", h);
+    g_suffix = buf;
+    LogLine((L"profile=" + g_localLow + L" suffix=" + g_suffix).c_str());
+
+    wchar_t bp[8] = {0};
+    if (GetEnvironmentVariableW(L"ASTRAL_STEAM_BYPASS", bp, 8) > 0 && bp[0] == L'1')
     {
-        wchar_t buf[64] = {0};
-        unsigned h = 0;
-        for (size_t i = 0; i < g_localLow.size(); i++) h = h * 131 + (unsigned)g_localLow[i];
-        swprintf_s(buf, L"_P%08X", h);
-        g_suffix = buf;
-        LogLine((L"profile=" + g_localLow + L" suffix=" + g_suffix).c_str());
+        g_steamBypass = TRUE;
+        CreateThread(nullptr, 0, SteamBypassThread, nullptr, 0, nullptr);
     }
 
+    // 只 hook SHGetKnownFolderPath：加载器初始化阶段不要动 ntdll
     if (MH_Initialize() != MH_OK) return TRUE;
-    MH_STATUS st1 = MH_CreateHookApi(L"kernel32.dll", "CreateMutexW", &Hook_CreateMutexW, reinterpret_cast<LPVOID*>(&g_origCreateMutexW));
-    MH_STATUS st2 = MH_CreateHookApi(L"kernel32.dll", "CreateMutexExW", &Hook_CreateMutexExW, reinterpret_cast<LPVOID*>(&g_origCreateMutexExW));
-    MH_STATUS st3 = MH_CreateHookApi(L"kernel32.dll", "OpenMutexW", &Hook_OpenMutexW, reinterpret_cast<LPVOID*>(&g_origOpenMutexW));
-    MH_CreateHookApi(L"kernel32.dll", "CreateMutexA", &Hook_CreateMutexA, reinterpret_cast<LPVOID*>(&g_origCreateMutexA));
-    MH_CreateHookApi(L"ntdll.dll", "NtCreateMutant", &Hook_NtCreateMutant, reinterpret_cast<LPVOID*>(&g_origNtCreateMutant));
-    MH_CreateHookApi(L"ntdll.dll", "NtOpenMutant", &Hook_NtOpenMutant, reinterpret_cast<LPVOID*>(&g_origNtOpenMutant));
-    MH_CreateHookApi(L"kernel32.dll", "CreateEventW", &Hook_CreateEventW, reinterpret_cast<LPVOID*>(&g_origCreateEventW));
-    MH_CreateHookApi(L"kernel32.dll", "OpenEventW", &Hook_OpenEventW, reinterpret_cast<LPVOID*>(&g_origOpenEventW));
-    MH_CreateHookApi(L"kernel32.dll", "CreateFileMappingW", &Hook_CreateFileMappingW, reinterpret_cast<LPVOID*>(&g_origCreateFileMappingW));
-    MH_CreateHookApi(L"kernel32.dll", "OpenFileMappingW", &Hook_OpenFileMappingW, reinterpret_cast<LPVOID*>(&g_origOpenFileMappingW));
-    MH_CreateHookApi(L"kernel32.dll", "OpenMutexA", &Hook_OpenMutexA, reinterpret_cast<LPVOID*>(&g_origOpenMutexA));
-    wchar_t dbg[256];
-    swprintf_s(dbg, L"hooks: cm=%d cme=%d om=%d", (int)st1, (int)st2, (int)st3);
+    MH_STATUS st = MH_CreateHookApi(L"shell32.dll", "SHGetKnownFolderPath",
+                                    &Hook_SHGetKnownFolderPath, reinterpret_cast<LPVOID*>(&g_origSHKFP));
+    wchar_t dbg[128];
+    swprintf_s(dbg, L"hook SHGetKnownFolderPath=%d", (int)st);
     LogLine(dbg);
-    if (MH_CreateHookApi(L"shell32.dll", "SHGetKnownFolderPath",
-                         &Hook_SHGetKnownFolderPath, reinterpret_cast<LPVOID*>(&g_origSHKFP)) == MH_OK)
-        MH_EnableHook(MH_ALL_HOOKS);
-
+    if (st == MH_OK) MH_EnableHook(MH_ALL_HOOKS);
     return TRUE;
 }
