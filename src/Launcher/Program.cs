@@ -67,16 +67,6 @@ namespace MultiLaunch
                     exe = @"D:\steam\steamapps\common\Astral Party\8vJXn6CN\AstralParty_CN.exe";
                     profile = ChooseAccount(@"D:\MultiProfiles");
                     if (profile == null) return 0;
-                    if (profile == "FIXCACHE")
-                    {
-                        FixCaches(@"D:\MultiProfiles");
-                        return 0;
-                    }
-                    if (profile == "CLEAN")
-                    {
-                        CleanSlots(Path.GetDirectoryName(exe));
-                        return 0;
-                    }
                     Console.WriteLine("选择账号: " + profile);
                 }
                 else if (args.Length == 1)
@@ -89,7 +79,6 @@ namespace MultiLaunch
                     exe = args[0];
                     profile = Path.GetFullPath(args[1]);
                 }
-                GroomSlots(Path.GetDirectoryName(exe));
                 EnsureSteamAppId(Path.GetDirectoryName(exe));
                 SeedSharedCaches(profile);
                 string dll = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "UserDataRedirect.dll");
@@ -97,19 +86,39 @@ namespace MultiLaunch
                 if (!File.Exists(dll)) { Console.WriteLine("找不到 DLL: " + dll); return 1; }
                 Directory.CreateDirectory(Path.Combine(profile, "AppData", "LocalLow"));
 
-                // 单实例检查按“进程名”判断：用固定槽位名（_S1.._S64）复用，避免堆一堆 _Data
+                // 单实例检查按“进程名”判断：给每个 profile 一个硬链接 exe 名
                 string runExe = exe;
                 try
                 {
-                    string baseName = AllocateSlot();
-                    string link = Path.Combine(Path.GetDirectoryName(exe), baseName + ".exe");
-                    if (!File.Exists(link)) CreateHardLink(link, exe, IntPtr.Zero);
-                    string dataSrc = Path.Combine(Path.GetDirectoryName(exe), "AstralParty_CN_Data");
-                    string dataDst = Path.Combine(Path.GetDirectoryName(exe), baseName + "_Data");
-                    if (!Directory.Exists(dataDst) && Directory.Exists(dataSrc))
-                        RunHidden("cmd.exe", "/c mklink /J \"" + dataDst + "\" \"" + dataSrc + "\"");
+                    int h = 0;
+                    foreach (char c in profile.ToLowerInvariant()) h = h * 31 + c;
+                    string link = Path.Combine(Path.GetDirectoryName(exe),
+                        "AstralParty_CN_" + Math.Abs(h).ToString("X8") + ".exe");
+                    if (!File.Exists(link))
+                    {
+                        if (!CreateHardLink(link, exe, IntPtr.Zero))
+                            File.Copy(exe, link, true);
+                    }
+                    // Unity 需要 <exe名>_Data 目录：用 junction 指回真实数据目录
+                    string realData = Path.Combine(Path.GetDirectoryName(exe),
+                        Path.GetFileNameWithoutExtension(exe) + "_Data");
+                    string linkData = Path.Combine(Path.GetDirectoryName(exe),
+                        Path.GetFileNameWithoutExtension(link) + "_Data");
+                    if (!Directory.Exists(linkData) && Directory.Exists(realData))
+                    {
+                        var mklink = new ProcessStartInfo("cmd.exe",
+                            "/c mklink /J \"" + linkData + "\" \"" + realData + "\"")
+                        {
+                            UseShellExecute = false,
+                            CreateNoWindow = true,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true
+                        };
+                        Process.Start(mklink);
+                        System.Threading.Thread.Sleep(300);
+                    }
                     runExe = link;
-                    Console.WriteLine("实例槽位: " + baseName);
+                    Console.WriteLine("实例 exe: " + Path.GetFileName(link));
                 }
                 catch (Exception le) { Console.WriteLine("创建实例 exe 失败: " + le.Message); }
 
@@ -205,26 +214,6 @@ namespace MultiLaunch
         }
 
         /// <summary>把大缓存（资源包）做成指向官方目录的 junction，避免每个实例重新下载；BnSdk 保持独立。</summary>
-        /// <summary>建 junction 并校验；失败时重试一次。</summary>
-        private static bool EnsureJunction(string dst, string src)
-        {
-            if (Directory.Exists(dst))
-            {
-                var di = new DirectoryInfo(dst);
-                return (di.Attributes & FileAttributes.ReparsePoint) != 0;
-            }
-            for (int attempt = 0; attempt < 2; attempt++)
-            {
-                RunHidden("cmd.exe", "/c mklink /J \"" + dst + "\" \"" + src + "\"");
-                if (Directory.Exists(dst))
-                {
-                    var di = new DirectoryInfo(dst);
-                    if ((di.Attributes & FileAttributes.ReparsePoint) != 0) return true;
-                }
-            }
-            return false;
-        }
-
         private static void SeedSharedCaches(string profile)
         {
             try
@@ -238,9 +227,17 @@ namespace MultiLaunch
                 {
                     string src = Path.Combine(official, name);
                     string dst = Path.Combine(target, name);
-                    if (!Directory.Exists(src)) continue;
-                    if (EnsureJunction(dst, src)) Console.WriteLine("link cache: " + name);
-                    else Console.WriteLine("!! 缓存链接失败: " + name);
+                    if (!Directory.Exists(src) || Directory.Exists(dst)) continue;
+                    var psi = new ProcessStartInfo("cmd.exe",
+                        "/c mklink /J \"" + dst + "\" \"" + src + "\"")
+                    {
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true
+                    };
+                    Process.Start(psi);
+                    Console.WriteLine("link cache: " + name);
                 }
                 System.Threading.Thread.Sleep(400);
             }
@@ -265,8 +262,6 @@ namespace MultiLaunch
                 Console.WriteLine("  " + (i + 1) + ") " + name + extra + (used ? "  [运行中]" : ""));
             }
             Console.WriteLine("  0) 新建账号");
-            Console.WriteLine("  8) 检查/修复缓存链接（磁盘占用）");
-            Console.WriteLine("  9) 清理游戏目录里的实例文件");
             Console.Write("请选择: ");
 
             string line = null;
@@ -277,9 +272,6 @@ namespace MultiLaunch
                 Console.WriteLine("未选择，退出。");
                 return null;
             }
-
-            if (sel == 8) return "FIXCACHE";
-            if (sel == 9) return "CLEAN";
 
             if (sel >= 1 && sel <= dirs.Count) return dirs[sel - 1];
 
@@ -422,151 +414,6 @@ namespace MultiLaunch
                 return dir;
             }
             return Path.Combine(root, "v" + DateTime.Now.Ticks);
-        }
-
-        /// <summary>找一个没在运行的槽位（_S1.._S64），复用已有文件。</summary>
-        private static string AllocateSlot()
-        {
-            for (int i = 1; i <= 64; i++)
-            {
-                string name = "AstralParty_CN_S" + i;
-                if (!SlotInUse(name)) return name;
-            }
-            return "AstralParty_CN_S" + DateTime.Now.Ticks;
-        }
-
-        private static bool SlotInUse(string name)
-        {
-            try
-            {
-                foreach (var p in Process.GetProcesses())
-                {
-                    try
-                    {
-                        if (string.Equals(p.ProcessName, name, StringComparison.OrdinalIgnoreCase)) return true;
-                    }
-                    catch { }
-                    finally { try { p.Dispose(); } catch { } }
-                }
-            }
-            catch { }
-            return false;
-        }
-
-        private static void RunHidden(string file, string args)
-        {
-            try
-            {
-                Process.Start(new ProcessStartInfo(file, args)
-                {
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true
-                });
-                System.Threading.Thread.Sleep(250);
-            }
-            catch { }
-        }
-
-        /// <summary>清理游戏根目录下本工具生成的实例 exe / _Data 链接。</summary>
-        private static void CleanSlots(string gameDir)
-        {
-            int files = 0, dirs = 0;
-            try
-            {
-                foreach (var f in Directory.GetFiles(gameDir, "AstralParty_CN_*.exe"))
-                {
-                    string n = Path.GetFileNameWithoutExtension(f);
-                    if (n == "AstralParty_CN") continue;
-                    try { File.Delete(f); files++; } catch { }
-                }
-                foreach (var d in Directory.GetDirectories(gameDir, "AstralParty_CN_*_Data"))
-                {
-                    if (Path.GetFileName(d) == "AstralParty_CN_Data") continue;
-                    try { RunHidden("cmd.exe", "/c rmdir \"" + d + "\""); dirs++; } catch { }
-                }
-                Console.WriteLine("已清理: exe " + files + " 个, _Data 目录 " + dirs + " 个");
-            }
-            catch (Exception e) { Console.WriteLine("清理失败: " + e.Message); }
-        }
-
-        /// <summary>启动时清理：删掉没有对应运行进程的实例 exe / _Data 链接（只删链接，不动原始数据）。</summary>
-        private static void GroomSlots(string gameDir)
-        {
-            try
-            {
-                foreach (var d in Directory.GetDirectories(gameDir, "AstralParty_CN_*_Data"))
-                {
-                    string name = Path.GetFileName(d);
-                    if (name == "AstralParty_CN_Data") continue;
-                    string stem = name.Substring(0, name.Length - "_Data".Length);
-                    if (SlotInUse(stem)) continue;
-                    RunHidden("cmd.exe", "/c rmdir \"" + d + "\"");
-                }
-                foreach (var f in Directory.GetFiles(gameDir, "AstralParty_CN_*.exe"))
-                {
-                    string stem = Path.GetFileNameWithoutExtension(f);
-                    if (stem == "AstralParty_CN") continue;
-                    if (SlotInUse(stem)) continue;
-                    try { File.Delete(f); } catch { }
-                }
-                foreach (var f in Directory.GetFiles(gameDir, "AstralParty_CN_*.gc.log"))
-                {
-                    try { File.Delete(f); } catch { }
-                }
-            }
-            catch { }
-        }
-
-        private static void FixCaches(string root)
-        {
-            string official = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                "AppData", "LocalLow", "feimo", "AstralParty_CN");
-            var caches = new[] { "com.unity.addressables", "NextPack", "NextPack.full-33", "Temp" };
-
-            foreach (var dir in Directory.GetDirectories(root))
-            {
-                string localLow = Path.Combine(dir, "AppData", "LocalLow", "feimo", "AstralParty_CN");
-                if (!Directory.Exists(localLow)) continue;
-                long total = 0;
-                var real = new System.Collections.Generic.List<string>();
-                foreach (var name in caches)
-                {
-                    string p = Path.Combine(localLow, name);
-                    if (!Directory.Exists(p)) continue;
-                    var di = new DirectoryInfo(p);
-                    bool isLink = (di.Attributes & FileAttributes.ReparsePoint) != 0;
-                    long size = 0;
-                    if (!isLink)
-                    {
-                        foreach (var f in Directory.GetFiles(p, "*", SearchOption.AllDirectories))
-                        {
-                            try { size += new FileInfo(f).Length; } catch { }
-                        }
-                        real.Add(name);
-                        total += size;
-                    }
-                }
-                Console.WriteLine(Path.GetFileName(dir) + ": 真实缓存 " + real.Count + " 个, 共 " + (total / 1024 / 1024) + " MB");
-                foreach (var name in real)
-                {
-                    string p = Path.Combine(localLow, name);
-                    string src = Path.Combine(official, name);
-                    Console.Write("  把 " + name + " 换成共享链接? (y/N): ");
-                    string ans = null;
-                    try { ans = Console.ReadLine(); } catch { }
-                    if (!string.Equals(ans, "y", StringComparison.OrdinalIgnoreCase)) continue;
-                    try
-                    {
-                        RunHidden("cmd.exe", "/c rmdir /s /q \"" + p + "\"");
-                        System.Threading.Thread.Sleep(500);
-                        if (!Directory.Exists(src)) { Console.WriteLine("  官方目录没有该缓存, 跳过"); continue; }
-                        Console.WriteLine(EnsureJunction(p, src) ? "  已修复: " + name : "  修复失败: " + name);
-                    }
-                    catch (Exception e) { Console.WriteLine("  出错: " + e.Message); }
-                }
-            }
         }
 
         private static IntPtr BuildEnv(string[] pairs)
