@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -79,8 +79,13 @@ namespace MultiLaunch
                     exe = args[0];
                     profile = Path.GetFullPath(args[1]);
                 }
-                EnsureSteamAppId(Path.GetDirectoryName(exe));
-                SeedSharedCaches(profile);
+                InitGameIdentity(exe);
+                EnsureSteamAppId(Path.GetDirectoryName(exe), GameBase);
+                bool bnsdkOnly = IsolateBnSdkOnly();
+                if (bnsdkOnly)
+                    Directory.CreateDirectory(Path.Combine(profile, "AppData", "LocalLow", "feimo", GameProduct, "BnSdk"));
+                else
+                    SeedSharedCaches(profile);
                 string dll = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "UserDataRedirect.dll");
                 if (!File.Exists(exe)) { Console.WriteLine("找不到游戏: " + exe); return 1; }
                 if (!File.Exists(dll)) { Console.WriteLine("找不到 DLL: " + dll); return 1; }
@@ -93,7 +98,7 @@ namespace MultiLaunch
                     int h = 0;
                     foreach (char c in profile.ToLowerInvariant()) h = h * 31 + c;
                     string link = Path.Combine(Path.GetDirectoryName(exe),
-                        "AstralParty_CN_" + Math.Abs(h).ToString("X8") + ".exe");
+                        GameBase + "_" + Math.Abs(h).ToString("X8") + ".exe");
                     if (!File.Exists(link))
                     {
                         if (!CreateHardLink(link, exe, IntPtr.Zero))
@@ -124,15 +129,24 @@ namespace MultiLaunch
 
                 var sb = new StringBuilder("\"" + runExe + "\"");
                 for (int i = 2; i < args.Length; i++) sb.Append(' ').Append(args[i]);
+                if (sb.ToString().IndexOf("-logFile", StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    Directory.CreateDirectory(profile);
+                    sb.Append(" -logFile \"").Append(Path.Combine(profile, "Player.log")).Append('"');
+                }
 
                 var si = new STARTUPINFO();
                 si.cb = Marshal.SizeOf(si);
                 PROCESS_INFORMATION pi;
+                string dataDir = Path.Combine(Path.GetDirectoryName(exe), GameBase + "_Data");
+                bool isWeGame = File.Exists(Path.Combine(dataDir, "Plugins", "x86_64", "rail_api64.dll"));
                 string bypass = SteamBypassEnabled() ? "1" : "0";
                 IntPtr env = BuildEnv(new[] {
                     "ASTRAL_PROFILE_DIR", profile,
                     "ASTRAL_LOG", Path.Combine(profile, "redirect.log"),
-                    "ASTRAL_STEAM_BYPASS", bypass
+                    "ASTRAL_BNSDK_ONLY", bnsdkOnly ? "1" : "0",
+                    "ASTRAL_STEAM_BYPASS", isWeGame ? "0" : bypass,
+                    "ASTRAL_WEGAME_BYPASS", isWeGame ? "1" : "0"
                 });
                 if (!CreateProcess(runExe, sb, IntPtr.Zero, IntPtr.Zero, false,
                     CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
@@ -170,11 +184,28 @@ namespace MultiLaunch
             catch { return true; }
         }
 
-        /// <summary>确保游戏目录有 steam_appid.txt（非 Steam 启动时 Steamworks 需要）。</summary>
-        private static void EnsureSteamAppId(string gameDir)
+        /// <summary>默认只隔离 BnSdk；配置 isolate=full 时退回整棵 LocalLow。</summary>
+        private static bool IsolateBnSdkOnly()
         {
             try
             {
+                string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
+                if (!File.Exists(path)) return true;
+                string text = File.ReadAllText(path).Replace(" ", "");
+                if (text.IndexOf("\"isolate\":\"full\"", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return false;
+                return true;
+            }
+            catch { return true; }
+        }
+
+        /// <summary>确保游戏目录有 steam_appid.txt（非 Steam 启动时 Steamworks 需要）。</summary>
+        private static void EnsureSteamAppId(string gameDir, string exeBase)
+        {
+            try
+            {
+                string plugins = Path.Combine(gameDir, exeBase + "_Data", "Plugins", "x86_64");
+                if (!File.Exists(Path.Combine(plugins, "steam_api64.dll"))) return;   // WeGame 版不需要
                 string path = Path.Combine(gameDir, "steam_appid.txt");
                 if (File.Exists(path))
                 {
@@ -220,8 +251,8 @@ namespace MultiLaunch
             {
                 string official = Path.Combine(
                     Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                    "AppData", "LocalLow", "feimo", "AstralParty_CN");
-                string target = Path.Combine(profile, "AppData", "LocalLow", "feimo", "AstralParty_CN");
+                    "AppData", "LocalLow", "feimo", GameProduct);
+                string target = Path.Combine(profile, "AppData", "LocalLow", "feimo", GameProduct);
                 Directory.CreateDirectory(target);
                 foreach (var name in new[] { "com.unity.addressables", "NextPack", "NextPack.full-33", "Temp" })
                 {
@@ -288,7 +319,7 @@ namespace MultiLaunch
         {
             try
             {
-                string baseDir = Path.Combine(dir, "AppData", "LocalLow", "feimo", "AstralParty_CN", "BnSdk");
+                string baseDir = Path.Combine(dir, "AppData", "LocalLow", "feimo", GameProduct, "BnSdk");
                 if (!Directory.Exists(baseDir)) return null;
                 FileInfo newest = null;
                 foreach (var f in Directory.GetFiles(baseDir, "*.log", SearchOption.AllDirectories))
@@ -414,6 +445,26 @@ namespace MultiLaunch
                 return dir;
             }
             return Path.Combine(root, "v" + DateTime.Now.Ticks);
+        }
+
+        private static string GameProduct = "AstralParty_CN";   // LocalLow 下的产品目录名
+        private static string GameBase    = "AstralParty_CN";   // exe 文件名（不含扩展名）
+
+        private static void InitGameIdentity(string exe)
+        {
+            GameBase = Path.GetFileNameWithoutExtension(exe);
+            string dataDir = Path.Combine(Path.GetDirectoryName(exe), GameBase + "_Data");
+            try
+            {
+                string info = Path.Combine(dataDir, "app.info");
+                if (File.Exists(info))
+                {
+                    string[] lines = File.ReadAllLines(info);
+                    if (lines.Length >= 2 && lines[1].Trim().Length > 0) GameProduct = lines[1].Trim();
+                }
+                else GameProduct = GameBase;
+            }
+            catch { GameProduct = GameBase; }
         }
 
         private static IntPtr BuildEnv(string[] pairs)

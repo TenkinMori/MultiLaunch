@@ -1,3 +1,4 @@
-﻿{
-  "steamBypass": true
+{
+  "steamBypass": true,
+  "isolate": "bnsdk"
 }

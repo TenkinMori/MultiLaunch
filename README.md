@@ -1,9 +1,10 @@
-﻿# MultiLaunch
+# MultiLaunch
 
 吉星派对（Astral Party）**多开启动器**：一个 exe，双击选账号，就能同时开多个客户端，各自独立登录。
 
-- 每个账号独立 `LocalLow`（BnSdk 登录凭据、Player.log 各自一份）
-- 大缓存（Addressables / NextPack）用 junction 共享，不重复下载
+- 默认只隔离 `BnSdk` 登录凭据和 `Player.log`，缓存/更新共用一份
+- 可选 `isolate=full` 退回整棵 `LocalLow` 隔离（兼容旧行为）
+- 大缓存（Addressables / NextPack）不再复制，也不用逐账号更新
 - 自动绕过客户端单实例检查（不同 exe 名 + `_Data` junction）
 - 自动补 `steam_appid.txt`，非 Steam 启动也能初始化 Steamworks
 - 内置 **Steam 绕过**（可开关）：不依赖 Steam 客户端，多实例互不冲突
@@ -35,13 +36,15 @@ MultiLaunch.exe
 
 ```json
 {
-  "steamBypass": true
+  "steamBypass": true,
+  "isolate": "bnsdk"
 }
 ```
 
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `steamBypass` | `true` | 是否在实例里绕过 Steam。开启后不依赖 Steam 客户端、可同时多开；关闭则恢复原版 Steam 行为（同一 Steam 账号只能单开） |
+| `isolate` | `bnsdk` | `bnsdk`=只隔离 BnSdk/Player.log，缓存共用；`full`=整棵 LocalLow 隔离（旧行为） |
 
 ## 目录结构
 
@@ -50,21 +53,24 @@ D:\MultiProfiles\<账号名>\
 ├── name.txt                       # 显示名
 ├── instance.lock                  # 运行中的进程 PID
 ├── redirect.log                   # 重定向 / 绕过日志
+├── Player.log                     # 该账号独立日志（-logFile）
 └── AppData\LocalLow\feimo\AstralParty_CN\
-    ├── BnSdk\                     # 该账号登录凭据（独立）
-    ├── Player.log                 # 该账号日志（独立）
-    ├── com.unity.addressables     # junction → 官方缓存（共享）
-    ├── NextPack                   # junction
-    ├── NextPack.full-33           # junction
-    └── Temp                       # junction
+    └── BnSdk\                     # 该账号登录凭据（独立）
 ```
+
+缓存、Addressables、NextPack、游戏更新都留在真实 `LocalLow` 下，所有实例共用。
 
 ## 原理
 
 1. **单实例检查**：客户端按进程名判断（`AstralParty_CN`），所以给每个账号生成
    `AstralParty_CN_XXXXXXXX.exe` 硬链接，并配同名 `_Data` junction。
-2. **数据隔离**：启动时注入 `UserDataRedirect.dll`，hook
-   `SHGetKnownFolderPath(FOLDERID_LocalAppDataLow)`，把 `LocalLow` 指到账号目录。
+2. **轻量隔离**：启动时注入 `UserDataRedirect.dll`。
+   - 默认只 hook `CreateFileW/A`、`GetFileAttributes*`、`FindFirstFile*`、
+     `CreateDirectoryW`、`DeleteFileW`、`MoveFileExW`、`CopyFileW`，
+     把 `%LocalLow%\feimo\AstralParty_CN\BnSdk` 替换成 profile 下的 `BnSdk`。
+   - `Player.log` 通过 Unity 的 `-logFile <profile>\Player.log` 分开。
+   - 缓存/更新不经过 profile，保持一份。
+   - `isolate=full` 时才 hook `SHGetKnownFolderPath`，恢复整棵 LocalLow 隔离。
 3. **Steam 绕过**：DLL 内静态编译了 steamhack（CesiumLoader 的独立实现），
    通过 il2cpp 找到 AOT 方法并 inline hook：
    - `SteamManager.Awake()` → no-op（不因非 Steam 启动自杀）
@@ -100,7 +106,8 @@ MultiLaunch/
 ├── src/
 │   ├── Launcher/Program.cs            # 账号菜单 / 进程创建 / DLL 注入
 │   └── Redirect/
-│       ├── UserDataRedirect.cpp       # LocalLow 重定向 + Steam 绕过安装
+│       ├── UserDataRedirect.cpp       # profile / Steam 绕过 / full 模式
+│       ├── bnsdk_hook.cpp             # 只重定向 BnSdk 的文件 API hook
 │       └── cesium/steam/              # steamhack（来自 CesiumLoader，MIT/BSD）
 ├── third_party/minhook/               # BSD-2-Clause
 ├── third_party/fmt/                   # MIT

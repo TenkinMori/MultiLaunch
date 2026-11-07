@@ -7,6 +7,7 @@ cl /nologo /LD /O2 /EHsc /MT /utf-8 /std:c++17 /D_CRT_SECURE_NO_WARNINGS /DFMT_H
   /I third_party\fmt\include ^
   /I src\Redirect\cesium ^
   src\Redirect\UserDataRedirect.cpp ^
+  src\Redirect\bnsdk_hook.cpp ^
   src\Redirect\cesium\steam\steamhack.cpp ^
   src\Redirect\cesium\steam\steam_diagnostics.cpp ^
   third_party\minhook\src\buffer.c third_party\minhook\src\hde\hde64.c ^

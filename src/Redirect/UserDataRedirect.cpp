@@ -1,5 +1,6 @@
-﻿// UserDataRedirect.dll
-// 按环境变量 ASTRAL_PROFILE_DIR 重定向 LocalLow 路径：
+// UserDataRedirect.dll
+// 默认 ASTRAL_BNSDK_ONLY=1：只把 BnSdk 重定向到 profile，缓存共用。
+// 配置 isolate=full 时按环境变量 ASTRAL_PROFILE_DIR 重定向整棵 LocalLow：
 //   <profile>\AppData\LocalLow
 // 通过 inline hook SHGetKnownFolderPath(FOLDERID_LocalAppDataLow) 实现。
 #include <windows.h>
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <winternl.h>
 #include "MinHook.h"
+#include "bnsdk_hook.h"
 #include "runtime/il2cpp_safe.h"
 #include "steam/steamhack.h"
 
@@ -236,6 +238,166 @@ static HRESULT WINAPI Hook_SHGetKnownFolderPath(REFKNOWNFOLDERID rfid, DWORD fla
 // ---- 可选：Steam 绕过（ASTRAL_STEAM_BYPASS=1）----
 static BOOL g_steamBypass = FALSE;
 
+static void WriteNativeLog(const char* msg)
+{
+    wchar_t path[MAX_PATH] = {0};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (slash) *(slash + 1) = 0;
+    wcscat_s(path, L"AstralPartyPlus\\native.log");
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"a, ccs=UTF-8") == 0 && f)
+    {
+        SYSTEMTIME st; GetLocalTime(&st);
+        fwprintf(f, L"[%02d:%02d:%02d] %S\n", st.wHour, st.wMinute, st.wSecond, msg);
+        fclose(f);
+    }
+}
+
+// ---- 彩色名字（原生方案）：hook AccountLogic.ChangeName(string)，把名字包成 UBB 颜色 ----
+typedef void* (*FnStringNew)(const char*);
+static FnStringNew g_il2cppStringNew = nullptr;
+typedef void* (*FnChangeName)(void*, void*, void*);
+static FnChangeName g_origChangeName = nullptr;
+
+static std::string ReadNameColorPrefix()
+{
+    // AstralPartyPlus\namecolor.txt 第一行=前缀，第二行=后缀
+    wchar_t path[MAX_PATH] = {0};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (slash) *(slash + 1) = 0;
+    wcscat_s(path, L"AstralPartyPlus\\namecolor.txt");
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"rb") != 0 || !f) return std::string();
+    char buf[512] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    std::string text(buf, n);
+    size_t nl = text.find('\n');
+    if (nl == std::string::npos) return std::string();
+    return text;
+}
+
+static bool ReadRenameNow(std::string& out)
+{
+    wchar_t path[MAX_PATH] = {0};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (slash) *(slash + 1) = 0;
+    wcscat_s(path, L"AstralPartyPlus\\rename_now.txt");
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"rb") != 0 || !f) return false;
+    char buf[2048] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    _wremove(path);
+    WriteNativeLog("consumed rename_now");
+    out.assign(buf, n);
+    while (!out.empty() && (out.back() == '\r' || out.back() == '\n')) out.pop_back();
+    return !out.empty();
+}
+
+static void* HookChangeName(void* self, void* nameStr, void* method)
+{
+    try
+    {
+        std::string forced;
+        if (ReadRenameNow(forced) && g_il2cppStringNew)
+        {
+            void* ns = g_il2cppStringNew(forced.c_str());
+            LogLine(L"namecolor: applied rename_now.txt");
+            return g_origChangeName(self, ns, method);
+        }
+        std::string cfg = ReadNameColorPrefix();
+        if (cfg.empty() || !g_il2cppStringNew) return g_origChangeName(self, nameStr, method);
+
+        size_t nl = cfg.find('\n');
+        std::string prefix = cfg.substr(0, nl);
+        std::string suffix;
+        if (nl != std::string::npos)
+        {
+            suffix = cfg.substr(nl + 1);
+            size_t n2 = suffix.find('\n');
+            if (n2 != std::string::npos) suffix = suffix.substr(0, n2);
+        }
+        while (!prefix.empty() && (prefix.back() == '\r' || prefix.back() == ' ')) prefix.pop_back();
+        while (!suffix.empty() && (suffix.back() == '\r' || suffix.back() == ' ')) suffix.pop_back();
+        if (prefix.empty()) return g_origChangeName(self, nameStr, method);
+
+        std::wstring wname = L"";
+        // 通过 il2cpp_string_chars 拿 UTF-16
+        typedef const wchar_t* (*FnChars)(void*);
+        static FnChars chars = nullptr;
+        if (!chars)
+        {
+            HMODULE ga = GetModuleHandleW(L"GameAssembly.dll");
+            if (ga) chars = (FnChars)GetProcAddress(ga, "il2cpp_string_chars");
+        }
+        if (!chars || !nameStr) return g_origChangeName(self, nameStr, method);
+        const wchar_t* w = chars(nameStr);
+        if (!w) return g_origChangeName(self, nameStr, method);
+
+        std::wstring full = std::wstring(prefix.begin(), prefix.end()) + w + std::wstring(suffix.begin(), suffix.end());
+        int need = WideCharToMultiByte(CP_UTF8, 0, full.c_str(), (int)full.size(), nullptr, 0, nullptr, nullptr);
+        std::string utf8(need, 0);
+        WideCharToMultiByte(CP_UTF8, 0, full.c_str(), (int)full.size(), &utf8[0], need, nullptr, nullptr);
+        void* ns = g_il2cppStringNew(utf8.c_str());
+        LogLine(L"namecolor: hooked ChangeName");
+        return g_origChangeName(self, ns, method);
+    }
+    catch (...) { return g_origChangeName(self, nameStr, method); }
+}
+
+static bool InstallNameColorHook()
+{
+    HMODULE ga = GetModuleHandleW(L"GameAssembly.dll");
+    if (!ga) { WriteNativeLog("no GameAssembly"); return false; }
+    typedef void* (*L_DomainGet)();
+    typedef void** (*L_DomainGetAssemblies)(void*, size_t*);
+    typedef void* (*L_AssemblyGetImage)(void*);
+    typedef void* (*L_ClassFromName)(void*, const char*, const char*);
+    typedef void* (*L_ClassGetMethodFromName)(void*, const char*, int);
+    typedef void* (*L_ThreadAttach)(void*);
+    auto domain_get = (L_DomainGet)GetProcAddress(ga, "il2cpp_domain_get");
+    auto domain_get_assemblies = (L_DomainGetAssemblies)GetProcAddress(ga, "il2cpp_domain_get_assemblies");
+    auto assembly_get_image = (L_AssemblyGetImage)GetProcAddress(ga, "il2cpp_assembly_get_image");
+    auto class_from_name = (L_ClassFromName)GetProcAddress(ga, "il2cpp_class_from_name");
+    auto class_get_method = (L_ClassGetMethodFromName)GetProcAddress(ga, "il2cpp_class_get_method_from_name");
+    auto thread_attach = (L_ThreadAttach)GetProcAddress(ga, "il2cpp_thread_attach");
+    g_il2cppStringNew = (FnStringNew)GetProcAddress(ga, "il2cpp_string_new");
+    if (!domain_get || !class_from_name || !class_get_method || !g_il2cppStringNew)
+    { WriteNativeLog("il2cpp exports missing"); return false; }
+
+    void* domain = domain_get();
+    if (!domain) { WriteNativeLog("domain not ready"); return false; }
+    if (thread_attach) thread_attach(domain);
+    size_t count = 0;
+    void** assemblies = domain_get_assemblies(domain, &count);
+    for (size_t i = 0; assemblies && i < count; i++)
+    {
+        void* image = assembly_get_image(assemblies[i]);
+        if (!image) continue;
+        void* klass = class_from_name(image, "GameLogic", "AccountLogic");
+        if (!klass) continue;
+        WriteNativeLog("found AccountLogic");
+        void* method = class_get_method(klass, "ChangeName", 1);
+        if (!method) { WriteNativeLog("ChangeName not found"); continue; }
+        WriteNativeLog("found ChangeName");
+        void* code = *(void**)method;
+        if (MH_CreateHook(code, &HookChangeName, reinterpret_cast<LPVOID*>(&g_origChangeName)) == MH_OK)
+        {
+            MH_EnableHook(code);
+            WriteNativeLog("hook installed");
+            LogLine(L"namecolor: ChangeName hook installed");
+            return true;
+        }
+    }
+    WriteNativeLog("AccountLogic.ChangeName not found");
+    LogLine(L"namecolor: AccountLogic.ChangeName not found");
+    return false;
+}
+
 // ---- 独立实现：把 AOT 的 SteamManager.Awake() 改成 ret（不依赖任何 loader）----
 typedef void* (*FnDomainGet)();
 typedef void** (*FnDomainGetAssemblies)(void*, size_t*);
@@ -255,16 +417,41 @@ static bool PatchRet(void* code)
     return true;
 }
 
-static void PatchSteamManagerAwake()
+static bool WaitIl2CppReady(HMODULE ga, int timeoutMs)
+{
+    auto domain_get = (FnDomainGet)GetProcAddress(ga, "il2cpp_domain_get");
+    auto get_assemblies = (FnDomainGetAssemblies)GetProcAddress(ga, "il2cpp_domain_get_assemblies");
+    if (!domain_get || !get_assemblies) return false;
+    for (int i = 0; i < timeoutMs / 50; i++)
+    {
+        void* d = domain_get();
+        if (d)
+        {
+            size_t n = 0;
+            void** a = get_assemblies(d, &n);
+            if (a && n > 0) return true;
+        }
+        Sleep(50);
+    }
+    return false;
+}
+
+static void PatchAwakeClass(const char* className)
 {
     HMODULE ga = GetModuleHandleW(L"GameAssembly.dll");
     if (!ga) return;
-    auto domain_get = (FnDomainGet)GetProcAddress(ga, "il2cpp_domain_get");
-    auto domain_get_assemblies = (FnDomainGetAssemblies)GetProcAddress(ga, "il2cpp_domain_get_assemblies");
-    auto assembly_get_image = (FnAssemblyGetImage)GetProcAddress(ga, "il2cpp_assembly_get_image");
-    auto class_from_name = (FnClassFromName)GetProcAddress(ga, "il2cpp_class_from_name");
-    auto class_get_method = (FnClassGetMethodFromName)GetProcAddress(ga, "il2cpp_class_get_method_from_name");
-    auto thread_attach = (FnThreadAttach)GetProcAddress(ga, "il2cpp_thread_attach");
+    typedef void* (*L_DomainGet)();
+    typedef void** (*L_DomainGetAssemblies)(void*, size_t*);
+    typedef void* (*L_AssemblyGetImage)(void*);
+    typedef void* (*L_ClassFromName)(void*, const char*, const char*);
+    typedef void* (*L_ClassGetMethodFromName)(void*, const char*, int);
+    typedef void* (*L_ThreadAttach)(void*);
+    auto domain_get = (L_DomainGet)GetProcAddress(ga, "il2cpp_domain_get");
+    auto domain_get_assemblies = (L_DomainGetAssemblies)GetProcAddress(ga, "il2cpp_domain_get_assemblies");
+    auto assembly_get_image = (L_AssemblyGetImage)GetProcAddress(ga, "il2cpp_assembly_get_image");
+    auto class_from_name = (L_ClassFromName)GetProcAddress(ga, "il2cpp_class_from_name");
+    auto class_get_method = (L_ClassGetMethodFromName)GetProcAddress(ga, "il2cpp_class_get_method_from_name");
+    auto thread_attach = (L_ThreadAttach)GetProcAddress(ga, "il2cpp_thread_attach");
     if (!domain_get || !domain_get_assemblies || !assembly_get_image || !class_from_name || !class_get_method)
     {
         LogLine(L"bypass: il2cpp exports missing");
@@ -280,18 +467,18 @@ static void PatchSteamManagerAwake()
     {
         void* image = assembly_get_image(assemblies[i]);
         if (!image) continue;
-        void* klass = class_from_name(image, "", "SteamManager");
+        void* klass = class_from_name(image, "", className);
         if (!klass) continue;
         void* method = class_get_method(klass, "Awake", 0);
-        if (!method) { LogLine(L"bypass: SteamManager.Awake not found"); return; }
+        if (!method) { LogLine(L"bypass: Awake not found"); return; }
         void* code = *(void**)method; // MethodInfo.methodPointer 在偏移 0
         bool ok = PatchRet(code);
         wchar_t buf[128];
-        swprintf_s(buf, L"bypass: SteamManager.Awake patched=%d code=%p", (int)ok, code);
+        swprintf_s(buf, L"bypass: %S.Awake patched=%d code=%p", className, (int)ok, code);
         LogLine(buf);
         return;
     }
-    LogLine(L"bypass: SteamManager class not found");
+    LogLine(L"bypass: class not found");
 }
 
 typedef bool(WINAPI* PFN_Init)();
@@ -307,6 +494,50 @@ static bool WINAPI Hook_SteamInit() { LogLine(L"steam: Init -> true"); return tr
 static int WINAPI Hook_SteamInitFlat() { LogLine(L"steam: InitFlat -> 0"); return 0; }
 static bool WINAPI Hook_SteamRestart(unsigned int) { LogLine(L"steam: RestartAppIfNecessary -> false"); return false; }
 static void WINAPI Hook_SteamShutdown() { LogLine(L"steam: Shutdown (noop)"); }
+
+static void PatchSteamManagerAwake() { PatchAwakeClass("SteamManager"); }
+
+static BOOL g_wegameBypass = FALSE;
+
+static bool PatchRailRestart()
+{
+    HMODULE m = GetModuleHandleW(L"rail_api64.dll");
+    if (!m) return false;
+    FARPROC f = GetProcAddress(m, "RailNeedRestartAppForCheckingEnvironment");
+    if (!f) { LogLine(L"wegame: RailNeedRestartAppForCheckingEnvironment not found"); return false; }
+    unsigned char* p = (unsigned char*)f;
+    DWORD old = 0;
+    if (!VirtualProtect(p, 8, PAGE_EXECUTE_READWRITE, &old)) return false;
+    // xor eax,eax ; ret
+    p[0] = 0x31; p[1] = 0xC0; p[2] = 0xC3;
+    VirtualProtect(p, 8, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 8);
+    return true;
+}
+
+static DWORD WINAPI WeGameBypassThread(LPVOID)
+{
+    // 先补 rail 的“需要重启”检查，再补 WeGameManager.Awake；每 1ms 轮询，尽量赶在 Awake 之前
+    // 只补 rail 的原生导出（返回 false=无需重启），不去碰 il2cpp，避免 GC 线程问题
+    bool railDone = false;
+    for (int i = 0; i < 20000 && !railDone; i++)
+    {
+        if (PatchRailRestart()) { railDone = true; LogLine(L"wegame: rail restart check patched"); }
+        Sleep(1);
+    }
+    if (!railDone) LogLine(L"wegame: rail patch timeout");
+    // 等 il2cpp 真正可用后再改 WeGameManager.Awake（太早调用会触发 GC fatal）
+    HMODULE ga = nullptr;
+    for (int i = 0; i < 600 && !ga; i++) { ga = GetModuleHandleW(L"GameAssembly.dll"); if (!ga) Sleep(50); }
+    if (ga && WaitIl2CppReady(ga, 15000))
+    {
+        LogLine(L"wegame: il2cpp ready, patching WeGameManager.Awake");
+        PatchAwakeClass("WeGameManager");
+    }
+    else
+        LogLine(L"wegame: il2cpp not ready, skip awake patch");
+    return 0;
+}
 
 static DWORD WINAPI SteamBypassThread(LPVOID)
 {
@@ -404,9 +635,51 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
 {
     if (reason != DLL_PROCESS_ATTACH) return TRUE;
 
+    MH_Initialize();
+
+    // ---- 彩色名字：不依赖 profile，双击启动也能用 ----
+    bool nameColor = false;
+    wchar_t nc[8] = {0};
+    if (GetEnvironmentVariableW(L"ASTRAL_NAMECOLOR", nc, 8) > 0 && nc[0] == L'1') nameColor = true;
+    if (!nameColor)
+    {
+        wchar_t exe[MAX_PATH] = {0};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        wchar_t* slash = wcsrchr(exe, L'\\');
+        if (slash) *(slash + 1) = 0;
+        wcscat_s(exe, L"AstralPartyPlus\\namecolor.txt");
+        if (GetFileAttributesW(exe) != INVALID_FILE_ATTRIBUTES) nameColor = true;
+    }
+    WriteNativeLog(nameColor ? "namecolor enabled" : "namecolor disabled");
+    if (nameColor)
+    {
+        CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+            WriteNativeLog("hook thread start");
+            for (int i = 0; i < 900; i++)
+            {
+                if (GetModuleHandleW(L"GameAssembly.dll"))
+                {
+                    if (InstallNameColorHook()) { WriteNativeLog("hook thread done"); break; }
+                }
+                Sleep(100);
+            }
+            return 0;
+        }, nullptr, 0, nullptr);
+    }
+
     std::wstring root = WideFromEnv(L"ASTRAL_PROFILE_DIR");
     if (root.empty()) return TRUE;
-    if (!root.empty() && root.back() == L'\\') root.pop_back();
+    if (root.back() == L'\\') root.pop_back();
+
+    wchar_t bnsdkOnly[8] = {0};
+    if (GetEnvironmentVariableW(L"ASTRAL_BNSDK_ONLY", bnsdkOnly, 8) > 0 && bnsdkOnly[0] == L'1')
+    {
+        // 只隔离 BnSdk；LocalLow 其余内容（缓存 / 更新 / 设置）保持共用。
+        g_enabled = TRUE;
+        BnSdkHook_Install(root);
+        LogLine((L"bnsdk-only profile=" + root).c_str());
+        return TRUE;
+    }
 
     g_localLow = root + L"\\AppData\\LocalLow";
     EnsureDir(g_localLow);
@@ -419,6 +692,13 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
     g_suffix = buf;
     LogLine((L"profile=" + g_localLow + L" suffix=" + g_suffix).c_str());
 
+    wchar_t wg[8] = {0};
+    if (GetEnvironmentVariableW(L"ASTRAL_WEGAME_BYPASS", wg, 8) > 0 && wg[0] == L'1')
+    {
+        g_wegameBypass = TRUE;
+        CreateThread(nullptr, 0, WeGameBypassThread, nullptr, 0, nullptr);
+    }
+
     wchar_t bp[8] = {0};
     if (GetEnvironmentVariableW(L"ASTRAL_STEAM_BYPASS", bp, 8) > 0 && bp[0] == L'1')
     {
@@ -426,8 +706,6 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
         CreateThread(nullptr, 0, SteamBypassThread, nullptr, 0, nullptr);
     }
 
-    // 只 hook SHGetKnownFolderPath：加载器初始化阶段不要动 ntdll
-    if (MH_Initialize() != MH_OK) return TRUE;
     MH_STATUS st = MH_CreateHookApi(L"shell32.dll", "SHGetKnownFolderPath",
                                     &Hook_SHGetKnownFolderPath, reinterpret_cast<LPVOID*>(&g_origSHKFP));
     wchar_t dbg[128];
