@@ -125,6 +125,15 @@ MultiLaunch/
   `AstralParty_CN_*.exe` 与 `AstralParty_CN_*_Data`（junction）后重新启动即可
 - 仅用于个人多账号管理，请遵守游戏用户协议
 
+## 更新记录
+
+- **v0.3.1（2026-11-12）适配新版客户端**
+  - `steam_appid.txt` 改为每次按 `steamapps/appmanifest_*.acf` 校正：
+    旧值 `110001933` 会让 BnSdk 的 Steam 初始化失败，登录界面出现约 20 秒后
+    `[SteamManager] 关闭游戏`（表现为「进不去游戏」）；现在会校正为 `2622000`
+  - `DetectAppId` 支持游戏目录是 `installdir` 子目录（`...\Astral Party\8vJXn6CN`）
+  - 已验证：两个账号同时停在登录界面，进程存活
+
 ## 来源与许可
 
 - `src/Redirect/cesium/steam/`（steamhack）来自 **CesiumLoader**

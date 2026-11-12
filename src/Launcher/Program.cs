@@ -199,7 +199,10 @@ namespace MultiLaunch
             catch { return true; }
         }
 
-        /// <summary>确保游戏目录有 steam_appid.txt（非 Steam 启动时 Steamworks 需要）。</summary>
+        /// <summary>确保游戏目录有 steam_appid.txt（非 Steam 启动时 Steamworks 需要）。
+        /// 2026-11-12 更新后：BnSdk 的 Steam 初始化失败会在约 20 秒后自动关游戏，
+        /// 而旧的 110001933 会让 init 失败；这里改成"按 manifest 反查并校正"，
+        /// 不再见到非空文件就跳过。</summary>
         private static void EnsureSteamAppId(string gameDir, string exeBase)
         {
             try
@@ -207,33 +210,50 @@ namespace MultiLaunch
                 string plugins = Path.Combine(gameDir, exeBase + "_Data", "Plugins", "x86_64");
                 if (!File.Exists(Path.Combine(plugins, "steam_api64.dll"))) return;   // WeGame 版不需要
                 string path = Path.Combine(gameDir, "steam_appid.txt");
-                if (File.Exists(path))
+                string cur = File.Exists(path) ? File.ReadAllText(path).Trim() : "";
+
+                string appId = DetectAppId(gameDir);
+                if (appId == null)
                 {
-                    string cur = File.ReadAllText(path).Trim();
-                    if (cur.Length > 0) return;
+                    if (cur.Length > 0) return;          // 查不到 manifest 就保留原值
+                    appId = "2622000";
                 }
 
-                string appId = DetectAppId(gameDir) ?? "2622000";
+                if (cur == appId) return;
                 File.WriteAllText(path, appId);
-                Console.WriteLine("已写入 steam_appid.txt: " + appId);
+                Console.WriteLine("已校正 steam_appid.txt: " + (cur.Length == 0 ? "(空)" : cur) + " -> " + appId);
             }
             catch (Exception e) { Console.WriteLine("写 steam_appid.txt 失败: " + e.Message); }
         }
 
-        /// <summary>从 steamapps/appmanifest_*.acf 反查 AppID（按 installdir）。</summary>
+        /// <summary>从 steamapps/appmanifest_*.acf 反查 AppID。
+        /// 游戏目录可能是 installdir 的子目录（如 ...\Astral Party\8vJXn6CN），
+        /// 所以按「gameDir 在 common\installdir 之下」判断，而不是只比最后一级目录名。</summary>
         private static string DetectAppId(string gameDir)
         {
             try
             {
                 var dir = new DirectoryInfo(gameDir);
-                string installDir = dir.Name;
-                var steamapps = dir.Parent != null ? dir.Parent.Parent : null; // ...\steamapps
+                if (dir.Parent == null) return null;
+                DirectoryInfo common = null;
+                if (dir.Parent.Name.Equals("common", StringComparison.OrdinalIgnoreCase))
+                    common = dir.Parent;
+                else if (dir.Parent.Parent != null && dir.Parent.Parent.Name.Equals("common", StringComparison.OrdinalIgnoreCase))
+                    common = dir.Parent.Parent;
+                if (common == null) return null;
+                var steamapps = common.Parent;   // ...\steamapps
                 if (steamapps == null || !steamapps.Name.Equals("steamapps", StringComparison.OrdinalIgnoreCase)) return null;
 
+                string full = dir.FullName.TrimEnd('\\') + "\\";
                 foreach (var f in Directory.GetFiles(steamapps.FullName, "appmanifest_*.acf"))
                 {
                     string text = File.ReadAllText(f);
-                    if (text.IndexOf("\"installdir\"\t\t\"" + installDir + "\"", StringComparison.OrdinalIgnoreCase) >= 0)
+                    var m = System.Text.RegularExpressions.Regex.Match(text, "\"installdir\"\\s+\"([^\"]+)\"");
+                    if (!m.Success) continue;
+                    string installDir = m.Groups[1].Value;
+                    string candidate = Path.Combine(common.FullName, installDir).TrimEnd('\\') + "\\";
+                    if (full.StartsWith(candidate, StringComparison.OrdinalIgnoreCase) ||
+                        full.TrimEnd('\\').Equals(candidate.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
                     {
                         var name = Path.GetFileNameWithoutExtension(f); // appmanifest_2622000
                         return name.Replace("appmanifest_", "");
